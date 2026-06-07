@@ -37,6 +37,10 @@ use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::Thread as AppServerThread;
 use codex_app_server_protocol::ThreadForkParams;
 use codex_app_server_protocol::ThreadForkResponse;
+use codex_app_server_protocol::ThreadGoalMutationOrigin;
+use codex_app_server_protocol::ThreadGoalSetParams;
+use codex_app_server_protocol::ThreadGoalSetResponse;
+use codex_app_server_protocol::ThreadGoalStatus;
 use codex_app_server_protocol::ThreadHistoryMode;
 use codex_app_server_protocol::ThreadItem as AppServerThreadItem;
 use codex_app_server_protocol::ThreadListParams;
@@ -103,6 +107,7 @@ use codex_protocol::protocol::ReviewRequest;
 use codex_protocol::protocol::ReviewTarget;
 use codex_protocol::protocol::SessionConfiguredEvent;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::validate_thread_goal_objective;
 use codex_protocol::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::canonicalize_existing_preserving_symlinks;
@@ -179,6 +184,7 @@ enum InitialOperation {
     UserTurn {
         items: Vec<UserInput>,
         output_schema: Option<Value>,
+        goal_objective: Option<String>,
     },
     Review {
         review_request: ReviewRequest,
@@ -933,13 +939,14 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                 })
                 .or(root_prompt);
             let prompt_text = resolve_prompt(prompt_arg);
+            let prepared_prompt = prepare_user_turn_prompt(prompt_text.clone())?;
             let mut items: Vec<UserInput> = imgs
                 .into_iter()
                 .chain(args.images.iter().cloned())
                 .map(|path| UserInput::LocalImage { path, detail: None })
                 .collect();
             items.push(UserInput::Text {
-                text: prompt_text.clone(),
+                text: prepared_prompt.turn_text,
                 // CLI input doesn't track UI element ranges, so none are available here.
                 text_elements: Vec::new(),
             });
@@ -948,6 +955,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                 InitialOperation::UserTurn {
                     items,
                     output_schema,
+                    goal_objective: prepared_prompt.goal_objective,
                 },
                 prompt_text,
             )
@@ -956,13 +964,14 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
             let prompt_arg = args.prompt.clone().or(root_prompt);
             if let Some(prompt_arg) = prompt_arg {
                 let prompt_text = resolve_prompt(Some(prompt_arg));
+                let prepared_prompt = prepare_user_turn_prompt(prompt_text.clone())?;
                 let mut items: Vec<UserInput> = imgs
                     .into_iter()
                     .chain(args.images.iter().cloned())
                     .map(|path| UserInput::LocalImage { path, detail: None })
                     .collect();
                 items.push(UserInput::Text {
-                    text: prompt_text.clone(),
+                    text: prepared_prompt.turn_text,
                     text_elements: Vec::new(),
                 });
                 let output_schema = load_output_schema(output_schema_path);
@@ -970,6 +979,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                     InitialOperation::UserTurn {
                         items,
                         output_schema,
+                        goal_objective: prepared_prompt.goal_objective,
                     },
                     prompt_text,
                 )
@@ -985,12 +995,13 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         }
         (None, root_prompt, imgs) => {
             let prompt_text = resolve_root_prompt(root_prompt);
+            let prepared_prompt = prepare_user_turn_prompt(prompt_text.clone())?;
             let mut items: Vec<UserInput> = imgs
                 .into_iter()
                 .map(|path| UserInput::LocalImage { path, detail: None })
                 .collect();
             items.push(UserInput::Text {
-                text: prompt_text.clone(),
+                text: prepared_prompt.turn_text,
                 // CLI input doesn't track UI element ranges, so none are available here.
                 text_elements: Vec::new(),
             });
@@ -999,6 +1010,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                 InitialOperation::UserTurn {
                     items,
                     output_schema,
+                    goal_objective: prepared_prompt.goal_objective,
                 },
                 prompt_text,
             )
@@ -1205,7 +1217,11 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         InitialOperation::UserTurn {
             items,
             output_schema,
+            goal_objective,
         } => {
+            if goal_objective.is_some() {
+                ensure_exec_goal_slash_supported(&config, state_db.as_ref())?;
+            }
             let cyber_access_program = match cyber_access_program {
                 Some(program) => Some(program),
                 None => {
@@ -1256,6 +1272,32 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
             .await
             .map_err(anyhow::Error::msg)?;
             let task_id = response.turn.id;
+            if let Some(goal_objective) = goal_objective
+                && let Err(err) = set_exec_thread_goal(
+                    &client,
+                    &mut request_ids,
+                    &primary_thread_id_for_span,
+                    &goal_objective,
+                )
+                .await
+            {
+                if let Err(interrupt_err) = send_request_with_response::<TurnInterruptResponse>(
+                    &client,
+                    ClientRequest::TurnInterrupt {
+                        request_id: request_ids.next(),
+                        params: TurnInterruptParams {
+                            thread_id: primary_thread_id_for_span.clone(),
+                            turn_id: task_id.clone(),
+                        },
+                    },
+                    "turn/interrupt",
+                )
+                .await
+                {
+                    warn!("turn/interrupt failed after thread goal setup error: {interrupt_err}");
+                }
+                return Err(err);
+            }
             info!("Sent prompt with event ID: {task_id}");
             task_id
         }
@@ -2226,6 +2268,84 @@ fn load_output_schema(path: Option<PathBuf>) -> Option<Value> {
             std::process::exit(1);
         }
     }
+}
+
+#[derive(Debug)]
+struct PreparedUserTurnPrompt {
+    turn_text: String,
+    goal_objective: Option<String>,
+}
+
+fn prepare_user_turn_prompt(prompt_text: String) -> anyhow::Result<PreparedUserTurnPrompt> {
+    let Some(rest) = prompt_text.strip_prefix("/goal") else {
+        return Ok(PreparedUserTurnPrompt {
+            turn_text: prompt_text,
+            goal_objective: None,
+        });
+    };
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return Ok(PreparedUserTurnPrompt {
+            turn_text: prompt_text,
+            goal_objective: None,
+        });
+    }
+
+    let objective = rest.trim().to_string();
+    validate_thread_goal_objective(&objective)
+        .map_err(|err| anyhow::anyhow!("invalid /goal command: {err}"))?;
+    match objective.to_ascii_lowercase().as_str() {
+        "clear" | "pause" | "resume" => {
+            anyhow::bail!(
+                "unsupported /goal control command in exec mode: /goal {objective}. Use /goal <objective> to start a goal."
+            );
+        }
+        _ => {}
+    }
+
+    Ok(PreparedUserTurnPrompt {
+        turn_text: objective.clone(),
+        goal_objective: Some(objective),
+    })
+}
+
+fn ensure_exec_goal_slash_supported(
+    config: &Config,
+    state_db: Option<&StateDbHandle>,
+) -> anyhow::Result<()> {
+    if !config.features.enabled(Feature::Goals) {
+        anyhow::bail!("cannot use /goal in exec mode because goals are disabled");
+    }
+    if config.ephemeral || state_db.is_none() {
+        anyhow::bail!("cannot use /goal in exec mode with an ephemeral thread");
+    }
+    Ok(())
+}
+
+async fn set_exec_thread_goal(
+    client: &InProcessAppServerClient,
+    request_ids: &mut RequestIdSequencer,
+    thread_id: &str,
+    objective: &str,
+) -> anyhow::Result<()> {
+    let _: ThreadGoalSetResponse = send_request_with_response(
+        client,
+        ClientRequest::ThreadGoalSet {
+            request_id: request_ids.next(),
+            params: ThreadGoalSetParams {
+                thread_id: thread_id.to_string(),
+                // The objective is the user's own CLI prompt; missing provenance
+                // would not carry user authorization.
+                origin: Some(ThreadGoalMutationOrigin::User),
+                objective: Some(objective.to_string()),
+                status: Some(ThreadGoalStatus::Active),
+                token_budget: None,
+            },
+        },
+        "thread/goal/set",
+    )
+    .await
+    .map_err(anyhow::Error::msg)?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
