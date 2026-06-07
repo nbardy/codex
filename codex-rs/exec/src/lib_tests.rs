@@ -103,6 +103,51 @@ fn exec_root_span_can_be_parented_from_trace_context() {
 }
 
 #[test]
+fn prepare_user_turn_prompt_extracts_goal_objective() {
+    let prepared = prepare_user_turn_prompt("/goal write 10 files".to_string())
+        .expect("goal prompt should parse");
+
+    assert_eq!(prepared.turn_text, "write 10 files");
+    assert_eq!(prepared.goal_objective.as_deref(), Some("write 10 files"));
+}
+
+#[test]
+fn prepare_user_turn_prompt_trims_goal_objective() {
+    let prepared = prepare_user_turn_prompt("/goal   write 10 files\n".to_string())
+        .expect("goal prompt should parse");
+
+    assert_eq!(prepared.turn_text, "write 10 files");
+    assert_eq!(prepared.goal_objective.as_deref(), Some("write 10 files"));
+}
+
+#[test]
+fn prepare_user_turn_prompt_ignores_non_goal_slash_prefix() {
+    let prepared = prepare_user_turn_prompt("/goalkeeper should stay plain".to_string())
+        .expect("plain prompt");
+
+    assert_eq!(prepared.turn_text, "/goalkeeper should stay plain");
+    assert_eq!(prepared.goal_objective, None);
+}
+
+#[test]
+fn prepare_user_turn_prompt_rejects_empty_goal_objective() {
+    let err = prepare_user_turn_prompt("/goal".to_string()).expect_err("empty goal should fail");
+
+    assert!(err.to_string().contains("goal objective must not be empty"));
+}
+
+#[test]
+fn prepare_user_turn_prompt_rejects_goal_control_commands() {
+    let err = prepare_user_turn_prompt("/goal pause".to_string())
+        .expect_err("control command should fail");
+
+    assert!(
+        err.to_string()
+            .contains("unsupported /goal control command in exec mode")
+    );
+}
+
+#[test]
 fn builds_uncommitted_review_request() {
     let args = ReviewArgs {
         uncommitted: true,
