@@ -128,7 +128,7 @@ pub(crate) async fn list(codex_home: PathBuf, cwd: PathBuf) -> anyhow::Result<Ve
     // Closing the popup discards its result; an already-running blocking Git call still finishes.
     tokio::task::spawn_blocking(move || {
         let cwd = codex_git_utils::get_git_repo_root(&cwd).unwrap_or(cwd);
-        let manager = codex_worktree::WorktreeManager::new(settings);
+        let manager = codex_worktree::WorktreeManager::for_host(settings);
         Ok(manager
             .list(&cwd)?
             .into_iter()
@@ -162,7 +162,7 @@ pub(crate) async fn remove(
     let settings =
         codex_worktree::WorktreeSettings::for_cli(&codex_home, host.config_toml.desktop.as_ref())?;
     tokio::task::spawn_blocking(move || {
-        codex_worktree::WorktreeManager::new(settings).remove(&source_cwd, &root)
+        codex_worktree::WorktreeManager::for_host(settings).remove(&source_cwd, &root)
     })
     .await?
 }

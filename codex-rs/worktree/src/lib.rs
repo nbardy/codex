@@ -1,6 +1,7 @@
 mod git;
 mod metadata;
 mod paths;
+mod provisioner;
 mod settings;
 
 use crate::git::GitOperation;
@@ -14,13 +15,14 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
 use serde::Serialize;
-use std::ffi::OsStr;
 use std::fs;
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
 
 pub use git::default_worktree_base;
+pub use provisioner::WORKTREE_COMMAND_ENV;
+pub use provisioner::WorktreeProvisioner;
 pub use settings::DEFAULT_WORKTREE_KEEP_COUNT;
 pub use settings::WorktreeSettings;
 
@@ -47,12 +49,29 @@ pub struct CreateWorktree {
 #[derive(Clone, Debug)]
 pub struct WorktreeManager {
     settings: WorktreeSettings,
+    provisioner: WorktreeProvisioner,
 }
 
 impl WorktreeManager {
     pub fn new(mut settings: WorktreeSettings) -> Self {
         settings.root = dunce::simplified(&settings.root).to_path_buf();
-        Self { settings }
+        Self {
+            settings,
+            provisioner: WorktreeProvisioner::Git,
+        }
+    }
+
+    /// A manager for the running host: checkouts are provisioned by the program
+    /// named in [`WORKTREE_COMMAND_ENV`], or by Git when it is unset. Production
+    /// call sites use this so every entry point honors the variable.
+    pub fn for_host(settings: WorktreeSettings) -> Self {
+        Self::new(settings).with_provisioner(WorktreeProvisioner::from_env())
+    }
+
+    /// Uses `provisioner` to materialize and remove checkouts.
+    pub fn with_provisioner(mut self, provisioner: WorktreeProvisioner) -> Self {
+        self.provisioner = provisioner;
+        self
     }
 
     pub fn settings(&self) -> &WorktreeSettings {
@@ -85,70 +104,16 @@ impl WorktreeManager {
         )?;
         let root = allocate_worktree_root(&self.settings.root, repository_name)?;
 
-        let result = git_output(
-            &source_root,
-            GitOperation::WorkingTree,
-            [
-                OsStr::new("worktree"),
-                OsStr::new("add"),
-                OsStr::new("--detach"),
-                OsStr::new("--no-checkout"),
-                root.as_os_str(),
-                OsStr::new(&head_sha),
-            ],
-        );
-        if let Err(error) = result {
+        if let Err(error) = provisioner::create(&self.provisioner, &source_root, &root, &head_sha) {
             remove_empty_bucket(&root);
-            return Err(error).context("cannot create managed worktree");
-        }
-
-        // Write only the destination's config, without changing shared settings or
-        // enabling worktreeConfig for the source repository.
-        let result = git_path(
-            &root,
-            [
-                "rev-parse",
-                "--path-format=absolute",
-                "--git-path",
-                "config.worktree",
-            ],
-        )
-        .and_then(|config| {
-            git_output(
-                &root,
-                GitOperation::Metadata,
-                [
-                    OsStr::new("config"),
-                    OsStr::new("--file"),
-                    config.as_os_str(),
-                    OsStr::new("core.worktree"),
-                    root.as_os_str(),
-                ],
-            )?;
-            // Discover destination-only filters before materializing files, and pin
-            // the working tree even when per-worktree configuration is disabled.
-            git_output(
-                &root,
-                GitOperation::WorkingTree,
-                [
-                    "--work-tree=.",
-                    "reset",
-                    "--hard",
-                    "--no-recurse-submodules",
-                    head_sha.as_str(),
-                ],
-            )
-        });
-        if let Err(error) = result {
-            remove_worktree(&source_root, &root)
-                .context("cannot roll back an incomplete managed worktree")?;
-            return Err(error).context("cannot populate managed worktree");
+            return Err(error);
         }
 
         let cwd = root.join(relative_cwd);
         if !is_safe_worktree_cwd(&root, &cwd) {
-            remove_worktree(&source_root, &root)
-                .context("cannot roll back a worktree missing its working directory")?;
+            let rolled_back = provisioner::rollback(&self.provisioner, &source_root, &root);
+            remove_empty_bucket(&root);
+            rolled_back.context("cannot roll back a worktree missing its working directory")?;
             bail!(
                 "requested base does not contain a safe working directory {}",
                 relative_cwd.display()
@@ -301,29 +266,7 @@ impl WorktreeManager {
         if source_cwd.starts_with(&checkout_root) {
             bail!("switch to another checkout before deleting the current worktree");
         }
-        let ignored = git_output(
-            &checkout.root,
-            GitOperation::WorkingTree,
-            [
-                OsStr::new("ls-files"),
-                OsStr::new("--others"),
-                OsStr::new("--ignored"),
-                OsStr::new("--exclude-standard"),
-                OsStr::new("-z"),
-            ],
-        )?;
-        if !ignored.stdout.is_empty() {
-            bail!("worktree contains ignored local files; remove them before deleting it");
-        }
-        git_output(
-            &checkout.source_root,
-            GitOperation::WorkingTree,
-            [
-                OsStr::new("worktree"),
-                OsStr::new("remove"),
-                root.as_os_str(),
-            ],
-        )?;
+        provisioner::remove(&self.provisioner, &checkout.source_root, &checkout.root)?;
         remove_empty_bucket(root);
         Ok(())
     }
@@ -344,21 +287,6 @@ impl WorktreeManager {
         linked_worktree_common_dir(&checkout)?;
         Ok(checkout)
     }
-}
-
-fn remove_worktree(source_root: &Path, root: &Path) -> Result<()> {
-    let result = git_output(
-        source_root,
-        GitOperation::WorkingTree,
-        [
-            OsStr::new("worktree"),
-            OsStr::new("remove"),
-            OsStr::new("--force"),
-            root.as_os_str(),
-        ],
-    );
-    remove_empty_bucket(root);
-    result.map(|_| ())
 }
 
 fn is_safe_worktree_cwd(root: &Path, cwd: &Path) -> bool {

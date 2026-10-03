@@ -139,30 +139,40 @@ pub fn default_worktree_base(cwd: &Path) -> Result<String> {
         .map(str::to_owned)
 }
 
+/// Repository-selecting variables that Git wrappers export to their children.
+/// Inheriting them would point a command at the wrong repository.
+const REPOSITORY_ENV_VARS: [&str; 16] = [
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_PREFIX",
+    "GIT_SHALLOW_FILE",
+    "GIT_COMMON_DIR",
+];
+
+/// Removes inherited repository state so `command` selects its repository
+/// from its arguments and cwd only. Shared by Git and external provisioners.
+pub(crate) fn scrub_repository_env(command: &mut Command) {
+    for name in REPOSITORY_ENV_VARS {
+        command.env_remove(name);
+    }
+}
+
 fn base_git_command(cwd: &Path) -> Command {
     let mut command = Command::new("git");
     // Git wrappers export repository-local state to their children. Select this
     // repository from cwd, and install only our own per-command config below.
-    for name in [
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        "GIT_CEILING_DIRECTORIES",
-        "GIT_CONFIG",
-        "GIT_CONFIG_PARAMETERS",
-        "GIT_CONFIG_COUNT",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_IMPLICIT_WORK_TREE",
-        "GIT_GRAFT_FILE",
-        "GIT_INDEX_FILE",
-        "GIT_NO_REPLACE_OBJECTS",
-        "GIT_REPLACE_REF_BASE",
-        "GIT_PREFIX",
-        "GIT_SHALLOW_FILE",
-        "GIT_COMMON_DIR",
-    ] {
-        command.env_remove(name);
-    }
+    scrub_repository_env(&mut command);
     command
         .current_dir(cwd)
         .arg("-c")
