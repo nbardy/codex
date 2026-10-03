@@ -182,7 +182,7 @@ impl App {
                     &self.config.codex_home,
                     host.config_toml.desktop.as_ref(),
                 )?;
-                let manager = codex_worktree::WorktreeManager::new(settings);
+                let manager = codex_worktree::WorktreeManager::for_host(settings);
                 anyhow::Ok(manager)
             }
             .await;

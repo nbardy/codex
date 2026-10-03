@@ -268,7 +268,7 @@ impl App {
                 &self.config.codex_home,
                 host.config_toml.desktop.as_ref(),
             )?;
-            anyhow::Ok(codex_worktree::WorktreeManager::new(settings))
+            anyhow::Ok(codex_worktree::WorktreeManager::for_host(settings))
         }
         .await;
         let manager = match setup {

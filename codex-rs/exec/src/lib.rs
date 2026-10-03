@@ -482,7 +482,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         .await;
         let settings =
             WorktreeSettings::for_cli(&codex_home, host_config.config_toml.desktop.as_ref())?;
-        let manager = WorktreeManager::new(settings);
+        let manager = WorktreeManager::for_host(settings);
         let checkout = manager.create(&CreateWorktree {
             source_cwd: config_cwd.as_path().to_path_buf(),
             base: None,

@@ -235,7 +235,7 @@ pub(super) async fn prepare(
         CloudConfigBundleLoader::default(),
     )
     .await;
-    let manager = codex_worktree::WorktreeManager::new(
+    let manager = codex_worktree::WorktreeManager::for_host(
         codex_worktree::WorktreeSettings::for_cli(
             &source.codex_home,
             host.config_toml.desktop.as_ref(),

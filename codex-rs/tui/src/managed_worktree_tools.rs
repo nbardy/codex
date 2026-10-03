@@ -77,7 +77,7 @@ impl ManagedWorktreeTools {
         )
         .await?;
         Ok(Self {
-            manager: WorktreeManager::new(WorktreeSettings::for_cli(
+            manager: WorktreeManager::for_host(WorktreeSettings::for_cli(
                 &config.codex_home,
                 host.config_toml.desktop.as_ref(),
             )?),
